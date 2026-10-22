@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: web-agent
+    runtime: node
+    plan: free             # sleeps after 15 min idle; ~1 min cold start; keep jobs under 15 min
+    buildCommand: npm install --omit=dev
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false        # asked for in the Render dashboard; never stored in git
+      - key: NVIDIA_API_KEY
+        sync: false
+      - key: ADMIN_TELEGRAM_ID
+        sync: false
+      - key: KERNEL_API_KEY
+        sync: false
+      - key: STEEL_API_KEY
+        sync: false        # optional backup browser provider (leave empty if unused)
+      - key: MAX_PARALLEL
+        value: "3"
+      - key: JOB_TIMEOUT_MIN
+        value: "12"           # free plan can idle out after 15 min without inbound traffic; keep tasks shorter

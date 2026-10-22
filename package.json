@@ -1,0 +1,15 @@
+{
+  "name": "web-agent",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Focused web-browsing agent (Telegram front-end, parallel browser sub-agents)",
+  "engines": { "node": ">=22.7" },
+  "scripts": {
+    "start": "node --experimental-strip-types --no-warnings src/server.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "node --experimental-strip-types --no-warnings tests/run-all.mjs"
+  },
+  "dependencies": { "puppeteer-core": "^23.11.1" },
+  "devDependencies": { "typescript": "^5.9.0", "@types/node": "^22.0.0" }
+}
