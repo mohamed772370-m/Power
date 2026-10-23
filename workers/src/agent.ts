@@ -259,13 +259,26 @@ export async function stepTool(env: Env, st: JobState, tg: Telegram): Promise<Jo
             : `⚠️ action غير صالح "${action}". المسموح: ${ALLOWED_ACTIONS.join(", ")}`;
         } else {
           pushStatus(st, `${pfx}🌐 [${st.step}] ${action} ${short(String(args.target ?? args.value ?? ""), 50)}`);
-          const r = await Promise.race([
-            browserAction(env, st.browser, st.chatId, action, String(args.target ?? ""), String(args.value ?? ""), {
-              sendPhoto: (c, b, cap) => tg.sendPhoto(c, b, cap),
-              analyzeImage: (b, p) => llmVision(env, b, p),
-            }),
-            new Promise<never>((_, rej) => setTimeout(() => rej(new Error(`مهلة حركة المتصفح (${action}) تجاوزت 150ث`)), 150_000)),
-          ]);
+          let r: { out: string; sess: typeof st.browser };
+          try {
+            r = await Promise.race([
+              browserAction(env, st.browser, st.chatId, action, String(args.target ?? ""), String(args.value ?? ""), {
+                sendPhoto: (c, b, cap) => tg.sendPhoto(c, b, cap),
+                analyzeImage: (b, p) => llmVision(env, b, p),
+              }),
+              new Promise<never>((_, rej) => setTimeout(() => rej(new Error("__bw_timeout__")), 150_000)),
+            ]);
+          } catch (e) {
+            if (e instanceof Error && e.message === "__bw_timeout__") {
+              // Abort semantics: destroy the session so the hung CDP action dies with it;
+              // the next action recreates a fresh session. Residual: the provider tab
+              // may have partially executed before teardown.
+              if (st.browser) await destroySession(env as any, st.browser).catch(() => {});
+              st.browser = null;
+              throw new Error(`مهلة حركة المتصفح (${action}) تجاوزت 150ث - أُغلقت الجلسة وأُجهضت الحركة`);
+            }
+            throw e;
+          }
           st.browser = r.sess;
           out = r.out;
           const u = out.match(/الرابط الحالي: (\S+)/); if (u) st.lastUrl = u[1];
