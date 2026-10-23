@@ -46,17 +46,28 @@ async function runUnits(env: Env, jobId: string): Promise<void> {
   if (!raw) return; // deleted (stopped or already delivered)
   if (await env.JOBS.get(`stopped:${jobId}`)) {
     // stopped while a message was in flight: clean up quietly
+    let chatId = "";
     try {
       const st = JSON.parse(raw) as JobState;
+      chatId = String(st.chatId ?? "");
       if (st.browser) await destroySession(env as any, st.browser);
     } catch { /* best effort */ }
     await env.JOBS.delete(`state:${jobId}`).catch(() => {});
     await env.JOBS.delete(`stopped:${jobId}`).catch(() => {});
+    if (chatId) await env.JOBS.delete(`job:${chatId}`).catch(() => {});
     return;
   }
   let st = JSON.parse(raw) as JobState;
   try {
     for (let i = 0; i < UNITS_PER_INVOCATION && st.next !== "done"; i++) {
+      // per-unit stop check: a /stop landing mid-delivery aborts before the next unit
+      if (await env.JOBS.get(`stopped:${jobId}`)) {
+        try { if (st.browser) await destroySession(env as any, st.browser); } catch { /* best effort */ }
+        await env.JOBS.delete(`state:${jobId}`).catch(() => {});
+        await env.JOBS.delete(`stopped:${jobId}`).catch(() => {});
+        await env.JOBS.delete(`job:${st.chatId}`).catch(() => {});
+        return;
+      }
       if (!st.plan) st = await stepPlan(env as any, st);
       else if (st.next === "llm") st = await stepLlm(env as any, st);
       else if (st.next === "tool") st = await stepTool(env as any, st, tg);
@@ -70,6 +81,15 @@ async function runUnits(env: Env, jobId: string): Promise<void> {
   if (st.next !== "done") {
     await env.JOBS.put(`state:${jobId}`, JSON.stringify(st), { expirationTtl: 3600 });
     await env.JOBS_QUEUE.send({ jobId });
+    return;
+  }
+  // final-send guard: a stop that landed during the last unit still suppresses delivery.
+  // NOTE: KV reads are edge-cached up to ~60s, so this is best-effort, not a hard cancel.
+  if (await env.JOBS.get(`stopped:${jobId}`)) {
+    try { if (st.browser) await destroySession(env as any, st.browser); } catch { /* best effort */ }
+    await env.JOBS.delete(`state:${jobId}`).catch(() => {});
+    await env.JOBS.delete(`stopped:${jobId}`).catch(() => {});
+    await env.JOBS.delete(`job:${st.chatId}`).catch(() => {});
     return;
   }
   // deliver
