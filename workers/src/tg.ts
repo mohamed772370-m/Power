@@ -30,6 +30,7 @@ export function createTelegram(token: string, base = "https://api.telegram.org")
   async function call(method: string, body: Record<string, unknown> = {}): Promise<any> {
     const res = await fetch(`${api}/${method}`, {
       method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+      signal: AbortSignal.timeout(15_000),
     });
     const data: any = await res.json().catch(() => ({ ok: false, description: `HTTP ${res.status}` }));
     if (!data.ok) throw new Error(`Telegram ${method}: ${data.description ?? res.status}`);
@@ -49,7 +50,7 @@ export function createTelegram(token: string, base = "https://api.telegram.org")
       const form = new FormData();
       form.append("chat_id", String(chatId)); form.append("caption", caption.slice(0, 1000));
       form.append("photo", new Blob([b64ToBytes(b64) as unknown as BlobPart], { type: "image/jpeg" }), "screen.jpg");
-      const res = await fetch(`${api}/sendPhoto`, { method: "POST", body: form });
+      const res = await fetch(`${api}/sendPhoto`, { method: "POST", body: form, signal: AbortSignal.timeout(30_000) });
       const data: any = await res.json().catch(() => ({ ok: false }));
       if (!data.ok) throw new Error(`Telegram sendPhoto: ${data.description ?? res.status}`);
     },
