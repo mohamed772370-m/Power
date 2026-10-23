@@ -146,9 +146,17 @@ export default {
       const statusMsgId = await tg.sendMessage(chatId, "⏳ بدأتُ العمل على المهمة…").catch(() => 0);
       const jobId = `job-${chatId}-${Date.now()}`;
       const st = initJobState(chatId, text, historyText(history), statusMsgId);
-      await env.JOBS.put(`state:${jobId}`, JSON.stringify(st), { expirationTtl: 3600 });
-      await env.JOBS.put(`job:${chatId}`, jobId, { expirationTtl: 3600 });
-      await env.JOBS_QUEUE.send({ jobId });
+      try {
+        await env.JOBS.put(`state:${jobId}`, JSON.stringify(st), { expirationTtl: 3600 });
+        await env.JOBS.put(`job:${chatId}`, jobId, { expirationTtl: 3600 });
+        // read-back: a missing state write would strand the job silently
+        const check = await env.JOBS.get(`state:${jobId}`);
+        if (!check) throw new Error("state read-back empty");
+        await env.JOBS_QUEUE.send({ jobId });
+      } catch (e) {
+        await env.JOBS.delete(`job:${chatId}`).catch(() => {});
+        await tg.sendMessage(chatId, `❌ تعذّر بدء المهمة (تخزين الحالة): ${(e instanceof Error ? e.message : String(e)).slice(0, 150)}`).catch(() => {});
+      }
       return Response.json({ ok: true });
     }
     return new Response("not found", { status: 404 });
