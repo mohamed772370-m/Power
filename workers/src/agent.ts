@@ -6,7 +6,7 @@ import { llmChat, llmVision, type Msg } from "./llm.ts";
 import { browserAction, destroySession, type BrowserSessionInfo } from "./browsercf.ts";
 import { readUrl } from "./readurl.ts";
 import { webSearch } from "./websearch.ts";
-import { BROWSER_ACTIONS, compactBrowserHistory } from "./browserutil.ts";
+import { ALLOWED_ACTIONS, READ_ONLY_MODE, STATE_CHANGING_ACTIONS, compactBrowserHistory } from "./browserutil.ts";
 import type { Telegram } from "./tg.ts";
 
 export interface Env {
@@ -81,7 +81,7 @@ export const BROWSE_SYSTEM_PROMPT =
 export const BROWSE_SUB_TOOLS = [
   { type: "function", function: { name: "act", description: "حركة متصفح واحدة.", parameters: { type: "object",
     properties: {
-      action: { type: "string", enum: [...BROWSER_ACTIONS], description: "goto(target=رابط) click(target=رقم) fill(target=رقم,value=نص) select(target=رقم,value=الخيار) press_enter press_key(value=اسم المفتاح) scroll_down scroll_up back close_tab extract_links(value=فلتر اختياري) wait vision_check screenshot" },
+      action: { type: "string", enum: [...ALLOWED_ACTIONS], description: "goto(target=رابط) click(target=رقم) fill(target=رقم,value=نص) select(target=رقم,value=الخيار) press_enter press_key(value=اسم المفتاح) scroll_down scroll_up back close_tab extract_links(value=فلتر اختياري) wait vision_check screenshot" },
       target: { type: "string", description: "رابط أو رقم العنصر" },
       value: { type: "string", description: "النص أو الخيار أو المفتاح" },
     }, required: ["action"] } } },
@@ -253,14 +253,19 @@ export async function stepTool(env: Env, st: JobState, tg: Telegram): Promise<Jo
     try {
       if (name === "act") {
         const action = String(args.action ?? "");
-        if (!(BROWSER_ACTIONS as readonly string[]).includes(action)) {
-          out = `⚠️ action غير صالح "${action}". المسموح: ${BROWSER_ACTIONS.join(", ")}`;
+        if (!(ALLOWED_ACTIONS as readonly string[]).includes(action)) {
+          out = READ_ONLY_MODE && (STATE_CHANGING_ACTIONS as readonly string[]).includes(action)
+            ? `🚫 وضع القراءة فقط مفعّل: الإجراء "${action}" محظور لأنه قد يغيّر حالة الموقع. المسموح: ${ALLOWED_ACTIONS.join(", ")}`
+            : `⚠️ action غير صالح "${action}". المسموح: ${ALLOWED_ACTIONS.join(", ")}`;
         } else {
           pushStatus(st, `${pfx}🌐 [${st.step}] ${action} ${short(String(args.target ?? args.value ?? ""), 50)}`);
-          const r = await browserAction(env, st.browser, st.chatId, action, String(args.target ?? ""), String(args.value ?? ""), {
-            sendPhoto: (c, b, cap) => tg.sendPhoto(c, b, cap),
-            analyzeImage: (b, p) => llmVision(env, b, p),
-          });
+          const r = await Promise.race([
+            browserAction(env, st.browser, st.chatId, action, String(args.target ?? ""), String(args.value ?? ""), {
+              sendPhoto: (c, b, cap) => tg.sendPhoto(c, b, cap),
+              analyzeImage: (b, p) => llmVision(env, b, p),
+            }),
+            new Promise<never>((_, rej) => setTimeout(() => rej(new Error(`مهلة حركة المتصفح (${action}) تجاوزت 150ث`)), 150_000)),
+          ]);
           st.browser = r.sess;
           out = r.out;
           const u = out.match(/الرابط الحالي: (\S+)/); if (u) st.lastUrl = u[1];

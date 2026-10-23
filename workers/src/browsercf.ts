@@ -1,3 +1,4 @@
+import { READ_ONLY_MODE, STATE_CHANGING_ACTIONS } from "./browserutil.ts";
 // Cloud browser controller for Workers: Kernel (primary) / Steel (backup) cloud
 // sessions driven over CDP WebSocket. Sessions live in the cloud across workflow
 // steps; each action opens a fresh WebSocket to the stored session and leaves
@@ -33,6 +34,7 @@ export async function createSession(env: BrowserEnv): Promise<Omit<BrowserSessio
         method: "POST",
         headers: { Authorization: `Bearer ${kernelKey}`, "Content-Type": "application/json" },
         body: JSON.stringify({ headless: true }),
+        signal: AbortSignal.timeout(45_000),
       });
       const body: any = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(`Kernel create failed (${res.status}): ${JSON.stringify(body).slice(0, 200)}`);
@@ -47,6 +49,7 @@ export async function createSession(env: BrowserEnv): Promise<Omit<BrowserSessio
   if (!steelKey) throw new Error("لا KERNEL_API_KEY ولا STEEL_API_KEY مضبوط");
   const res = await fetch("https://api.steel.dev/v1/sessions", {
     method: "POST", headers: { "steel-api-key": steelKey, "Content-Type": "application/json" }, body: JSON.stringify({}),
+    signal: AbortSignal.timeout(45_000),
   });
   const body: any = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(`Steel create failed (${res.status}): ${JSON.stringify(body).slice(0, 200)}`);
@@ -63,10 +66,12 @@ export async function destroySession(env: BrowserEnv, sess: Pick<BrowserSessionI
     if (sess.provider === "steel") {
       await fetch(`https://api.steel.dev/v1/sessions/${sess.sessionId}/release`, {
         method: "POST", headers: { "steel-api-key": (env.STEEL_API_KEY ?? "").trim() },
+        signal: AbortSignal.timeout(15_000),
       });
     } else {
       await fetch(`https://api.onkernel.com/browsers/${sess.sessionId}`, {
         method: "DELETE", headers: { Authorization: `Bearer ${(env.KERNEL_API_KEY ?? "").trim()}` },
+        signal: AbortSignal.timeout(15_000),
       });
     }
   } catch { /* cleanup must not mask the real error */ }
@@ -319,6 +324,10 @@ export async function browserAction(
   val: string,
   cbs: BrowserCbs,
 ): Promise<{ out: string; sess: BrowserSessionInfo | null }> {
+  // Executor-layer read-only enforcement (defense in depth; schema/dispatcher also guard).
+  if (READ_ONLY_MODE && (STATE_CHANGING_ACTIONS as readonly string[]).includes(act)) {
+    return { out: `🚫 وضع القراءة فقط: الإجراء "${act}" محظور.`, sess };
+  }
   if (!sess) {
     const created = await createSession(env);
     sess = { ...created, targets: [] };

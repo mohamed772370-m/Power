@@ -2,6 +2,14 @@
 // Added 2026-10-21: fixes for stateful-tool dedupe, mission browser steps, inspection cost, context bloat.
 
 export const BROWSER_ACTIONS = ["goto", "click", "fill", "select", "press_enter", "press_key", "scroll_down", "scroll_up", "back", "close_tab", "extract_links", "wait", "vision_check", "screenshot"] as const;
+// Enforced read-only pilot mode (migration safety, 2026-10-23): actions that can
+// change site state are blocked at the schema, dispatcher, and executor layers.
+// Flip to false only with the owner's explicit approval for state-changing tasks.
+export const READ_ONLY_MODE = true;
+export const STATE_CHANGING_ACTIONS = ["click", "fill", "select", "press_enter", "press_key"] as const;
+export const ALLOWED_ACTIONS = READ_ONLY_MODE
+  ? BROWSER_ACTIONS.filter((a) => !(STATE_CHANGING_ACTIONS as readonly string[]).includes(a))
+  : [...BROWSER_ACTIONS];
 export type BrowserAct = typeof BROWSER_ACTIONS[number];
 
 // Stateful tools must never be served from the duplicate-call cache:

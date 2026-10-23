@@ -183,6 +183,34 @@ export default {
   },
 
   async queue(batch: MessageBatch, env: Env): Promise<void> {
+    // Dead-letter queue: surface exhausted jobs to the user instead of stranding them.
+    if (batch.queue.endsWith("-dlq")) {
+      for (const message of batch.messages) {
+        try {
+          const { jobId } = message.body as { jobId: string };
+          const tg = createTelegram(env.TELEGRAM_BOT_TOKEN);
+          let chatId = Number(env.ADMIN_TELEGRAM_ID.split(",")[0].trim());
+          let goal = "";
+          const raw = await env.JOBS.get(`state:${jobId}`);
+          if (raw) {
+            try {
+              const st = JSON.parse(raw) as JobState;
+              chatId = st.chatId ?? chatId;
+              goal = st.goal ?? "";
+              if (st.browser) await destroySession(env as any, st.browser).catch(() => {});
+            } catch { /* best effort */ }
+          }
+          const note = `❌ تعذّر إكمال المهمة بعد عدة محاولات (عطل داخلي، لم تُحذف بياناتك): ${goal.slice(0, 150)}\nأعد إرسال الطلب للمحاولة مجدداً.`;
+          await tg.sendMessage(chatId, note).catch(() => {});
+          await env.JOBS.put(`last:${chatId}`, JSON.stringify({ ok: false, text: note, ms: 0, lines: [], at: Date.now() })).catch(() => {});
+          await env.JOBS.delete(`state:${jobId}`).catch(() => {});
+          await env.JOBS.delete(`stopped:${jobId}`).catch(() => {});
+          await env.JOBS.delete(`job:${chatId}`).catch(() => {});
+          message.ack();
+        } catch (e) { console.error("dlq handling failed:", e); message.retry(); }
+      }
+      return;
+    }
     for (const message of batch.messages) {
       try {
         const { jobId } = message.body as { jobId: string };

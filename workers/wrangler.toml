@@ -18,6 +18,13 @@ queue = "web-agent-jobs"
 max_batch_size = 1
 max_retries = 3
 max_concurrency = 1
+dead_letter_queue = "web-agent-jobs-dlq"
+
+[[queues.consumers]]
+queue = "web-agent-jobs-dlq"
+max_batch_size = 1
+max_retries = 3
+max_concurrency = 1
 
 [vars]
 ADMIN_TELEGRAM_ID = "8653341779"
