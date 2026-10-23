@@ -57,7 +57,7 @@ export async function readUrl(rawUrl: string, o: ReadUrlOpts = {}): Promise<stri
   let u: URL; try { u = new URL(url); } catch { return `⚠️ رابط غير صالح: ${rawUrl}`; }
   let res: Response | null = null;
   try {
-    for (let hop = 0; hop < 5; hop++) {
+    for (let hop = 0; hop < 2; hop++) {
       if (!/^https?:$/.test(u.protocol)) return "⚠️ يُسمح بروابط http/https فقط.";
       if (!o.allowPrivate && isPrivateHost(u.hostname)) return "⚠️ مرفوض: لا يُسمح بقراءة عناوين داخلية/محلية.";
       res = await doFetch(u.href, {

@@ -50,7 +50,7 @@ export interface JobState {
   stopped: boolean;
 }
 
-const MAX_STEPS = 30;
+const MAX_STEPS = 22;
 const SUB_BUDGET_MS = 240_000;
 const JOB_TIMEOUT_MS = 20 * 60_000;
 const OBSERVED_CAP = 200_000;
@@ -140,9 +140,9 @@ export async function stepPlan(env: Env, st: JobState): Promise<JobState> {
     try {
       const r = await llmChat(env, [
         { role: "system", content: PLAN_PROMPT },
-        { role: "user", content: `الطلب:\n${goal}\n\nالحد الأقصى للمهام الفرعية: 4` },
+        { role: "user", content: `الطلب:\n${goal}\n\nالحد الأقصى للمهام الفرعية: 3` },
       ], undefined, 0);
-      plan = parsePlan(String(r?.content ?? ""), goal, 4);
+      plan = parsePlan(String(r?.content ?? ""), goal, 3);
     } catch { /* keep single */ }
   }
   st.plan = plan;
@@ -298,7 +298,7 @@ export async function stepTool(env: Env, st: JobState, tg: Telegram): Promise<Jo
 async function maybeEditStatus(env: Env, st: JobState, tg: Telegram): Promise<void> {
   if (!st.statusMsgId) return;
   const now = Date.now();
-  if (now - st.lastStatusEdit < 4000) return;
+  if (now - st.lastStatusEdit < 20000) return;
   st.lastStatusEdit = now;
   await tg.editMessage(st.chatId, st.statusMsgId, "⏳ جارٍ التنفيذ…\n" + st.statusLines.slice(-8).join("\n")).catch(() => {});
 }

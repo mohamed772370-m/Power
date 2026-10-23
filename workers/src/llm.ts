@@ -40,7 +40,7 @@ async function runChain(env: LlmEnv, chain: string[], messages: Msg[], tools: un
   const base = "https://integrate.api.nvidia.com";
   let last: unknown = null;
   for (const model of chain) {
-    for (let attempt = 0; attempt < 2; attempt++) {
+    for (let attempt = 0; attempt < 1; attempt++) {
       try { return await once(base, env.NVIDIA_API_KEY, model, messages, tools, temperature); }
       catch (e) {
         last = e;

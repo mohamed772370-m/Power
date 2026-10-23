@@ -50,6 +50,11 @@ export class WebAgentWorkflow extends WorkflowEntrypoint<Env, Params> {
         else if (st.next === "tool") st = await step.do(`tool-${st.subIdx}-${st.step}-${st.pendingTools.length}`, RETRY, () => stepTool(env as any, st, tg));
         else if (st.next === "nextsub") st = await step.do(`nextsub-${st.subIdx}`, () => stepNextSubtask(env as any, st));
         else if (st.next === "synth") st = await step.do("synth", RETRY, () => stepSynth(env as any, st));
+        // Workflows co-runs consecutive steps in ONE invocation, sharing the
+        // 50-subrequest free-plan budget (measured failure: "Too many
+        // subrequests"). A 1s sleep forces the engine into a fresh invocation
+        // with a fresh budget every 3 work steps.
+        if (st.next !== "done" && guard % 3 === 0) await step.sleep(`yield-${guard}`, "5 seconds");
       }
       if (st.next !== "done") { ok = false; st.finalText = "❌ تجاوزت المهمة حد الخطوات الداخلي."; }
     } catch (e) {
