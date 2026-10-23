@@ -1,11 +1,12 @@
-// web-agent on Cloudflare Workers (free plan):
-//   POST /telegram (webhook, secret-token verified) -> starts one Workflow
-//   instance per browsing job; the job's browse loop runs one LLM call or one
-//   tool action per Workflow step, so every step gets a fresh 10ms CPU + 50
-//   subrequest budget with unlimited wall clock for I/O waits.
-//   GET /health -> liveness.
+// web-agent on Cloudflare Workers (free plan), queue-chained architecture:
+//   POST /telegram (webhook, secret-token verified) -> stores job state in KV
+//   and enqueues ONE message. Each queue delivery is a genuinely fresh Worker
+//   invocation with its own 50-subrequest budget (measured: a Workflow
+//   instance's budget is per instance - 51st fetch fails regardless of sleeps,
+//   probe-1792734234866). The consumer runs up to 4 state-machine units, saves
+//   state, and re-enqueues until the job is done.
+//   GET /health -> liveness. GET /last -> last job evidence (secret-keyed).
 // deno-lint-ignore-file no-explicit-any
-import { WorkflowEntrypoint } from "cloudflare:workers";
 import { createTelegram } from "./tg.ts";
 import {
   initJobState, stepPlan, stepLlm, stepTool, stepNextSubtask, stepSynth, destroySession,
@@ -14,7 +15,7 @@ import {
 
 export interface Env {
   JOBS: KVNamespace;
-  WEB_AGENT_WORKFLOW: any;
+  JOBS_QUEUE: Queue;
   ADMIN_TELEGRAM_ID: string;
   TELEGRAM_BOT_TOKEN: string;
   NVIDIA_API_KEY: string;
@@ -31,53 +32,7 @@ export const HELP_TEXT =
   "أمثلة:\n• قارن أسعار هذا المنتج في 3 مواقع: …\n• افتح الرابط … واستخرج الجدول\n• ادخل الموقع … واملأ النموذج بهذه البيانات\n\n" +
   "إن كانت المهمة تتكون من أجزاء مستقلة قسّمتها ونفّذتها بالتوازي لأسرع.\n/stop إيقاف المهمة الجارية\n/help هذه الرسالة";
 
-interface Params { chatId: number; goal: string; history: string; statusMsgId: number }
-
-const RETRY = { retries: { limit: 2, delay: "3 seconds", backoff: "exponential" } } as any;
-
-export class WebAgentWorkflow extends WorkflowEntrypoint<Env, Params> {
-  async run(event: any, step: any) {
-    const env = this.env;
-    const tg = createTelegram(env.TELEGRAM_BOT_TOKEN);
-    const { chatId, goal, history, statusMsgId } = event.payload as Params;
-    let st: JobState = initJobState(chatId, goal, history, statusMsgId);
-    let ok = true;
-    try {
-      st = await step.do("plan", RETRY, () => stepPlan(env as any, st));
-      let guard = 0;
-      while (st.next !== "done" && guard++ < 500) {
-        if (st.next === "llm") st = await step.do(`llm-${st.subIdx}-${st.step}`, RETRY, () => stepLlm(env as any, st));
-        else if (st.next === "tool") st = await step.do(`tool-${st.subIdx}-${st.step}-${st.pendingTools.length}`, RETRY, () => stepTool(env as any, st, tg));
-        else if (st.next === "nextsub") st = await step.do(`nextsub-${st.subIdx}`, () => stepNextSubtask(env as any, st));
-        else if (st.next === "synth") st = await step.do("synth", RETRY, () => stepSynth(env as any, st));
-        // Workflows co-runs consecutive steps in ONE invocation, sharing the
-        // 50-subrequest free-plan budget (measured failure: "Too many
-        // subrequests"). A 1s sleep forces the engine into a fresh invocation
-        // with a fresh budget every 3 work steps.
-        if (st.next !== "done" && guard % 3 === 0) await step.sleep(`yield-${guard}`, "5 seconds");
-      }
-      if (st.next !== "done") { ok = false; st.finalText = "❌ تجاوزت المهمة حد الخطوات الداخلي."; }
-    } catch (e) {
-      ok = false;
-      st.finalText = `❌ تعذّر إكمال المهمة: ${(e instanceof Error ? e.message : String(e)).slice(0, 300)}`;
-    }
-    await step.do("deliver", RETRY, async () => {
-      const secs = Math.round((Date.now() - st.startedAt) / 1000);
-      if (st.statusMsgId) await tg.editMessage(chatId, st.statusMsgId, `${ok ? "✅ انتهت" : "❌ فشلت"} المهمة (${secs}ث)`).catch(() => {});
-      await tg.sendMessage(chatId, st.finalText || "(لا نتيجة)").catch(() => {});
-      const key = `hist:${chatId}`;
-      try {
-        const arr = JSON.parse((await env.JOBS.get(key)) ?? "[]");
-        if (ok) { arr.push({ goal, answer: st.finalText }); await env.JOBS.put(key, JSON.stringify(arr.slice(-3))); }
-      } catch { /* history is best effort */ }
-      await env.JOBS.delete(`job:${chatId}`).catch(() => {});
-      if (st.browser) await destroySession(env as any, st.browser);
-      // evidence for testing/ops: last job result per chat
-      await env.JOBS.put(`last:${chatId}`, JSON.stringify({ ok, text: st.finalText, ms: Date.now() - st.startedAt, lines: st.statusLines.slice(-12), at: Date.now() })).catch(() => {});
-    });
-    return { ok, text: st.finalText.slice(0, 500) };
-  }
-}
+const UNITS_PER_INVOCATION = 4;
 
 function historyText(h: Array<{ goal: string; answer: string }>): string {
   return h.length
@@ -85,11 +40,67 @@ function historyText(h: Array<{ goal: string; answer: string }>): string {
     : "";
 }
 
+async function runUnits(env: Env, jobId: string): Promise<void> {
+  const tg = createTelegram(env.TELEGRAM_BOT_TOKEN);
+  const raw = await env.JOBS.get(`state:${jobId}`);
+  if (!raw) return; // deleted (stopped or already delivered)
+  if (await env.JOBS.get(`stopped:${jobId}`)) {
+    // stopped while a message was in flight: clean up quietly
+    try {
+      const st = JSON.parse(raw) as JobState;
+      if (st.browser) await destroySession(env as any, st.browser);
+    } catch { /* best effort */ }
+    await env.JOBS.delete(`state:${jobId}`).catch(() => {});
+    await env.JOBS.delete(`stopped:${jobId}`).catch(() => {});
+    return;
+  }
+  let st = JSON.parse(raw) as JobState;
+  try {
+    for (let i = 0; i < UNITS_PER_INVOCATION && st.next !== "done"; i++) {
+      if (!st.plan) st = await stepPlan(env as any, st);
+      else if (st.next === "llm") st = await stepLlm(env as any, st);
+      else if (st.next === "tool") st = await stepTool(env as any, st, tg);
+      else if (st.next === "nextsub") st = await stepNextSubtask(env as any, st);
+      else if (st.next === "synth") st = await stepSynth(env as any, st);
+    }
+  } catch (e) {
+    st.finalText = `❌ تعذّر إكمال المهمة: ${(e instanceof Error ? e.message : String(e)).slice(0, 300)}`;
+    st.next = "done";
+  }
+  if (st.next !== "done") {
+    await env.JOBS.put(`state:${jobId}`, JSON.stringify(st), { expirationTtl: 3600 });
+    await env.JOBS_QUEUE.send({ jobId });
+    return;
+  }
+  // deliver
+  const ok = !st.finalText.startsWith("❌");
+  const secs = Math.round((Date.now() - st.startedAt) / 1000);
+  if (st.statusMsgId) await tg.editMessage(st.chatId, st.statusMsgId, `${ok ? "✅ انتهت" : "❌ فشلت"} المهمة (${secs}ث)`).catch(() => {});
+  await tg.sendMessage(st.chatId, st.finalText || "(لا نتيجة)").catch(() => {});
+  try {
+    const key = `hist:${st.chatId}`;
+    const arr = JSON.parse((await env.JOBS.get(key)) ?? "[]");
+    if (ok) { arr.push({ goal: st.goal, answer: st.finalText }); await env.JOBS.put(key, JSON.stringify(arr.slice(-3))); }
+  } catch { /* history is best effort */ }
+  await env.JOBS.put(`last:${st.chatId}`, JSON.stringify({
+    ok, text: st.finalText, ms: Date.now() - st.startedAt, lines: st.statusLines.slice(-12), at: Date.now(),
+  })).catch(() => {});
+  if (st.browser) await destroySession(env as any, st.browser).catch(() => {});
+  await env.JOBS.delete(`state:${jobId}`).catch(() => {});
+  await env.JOBS.delete(`job:${st.chatId}`).catch(() => {});
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/health")) {
-      return Response.json({ ok: true, worker: "web-agent", ts: Date.now() });
+      return Response.json({ ok: true, worker: "web-agent", mode: "queue-chained", ts: Date.now() });
+    }
+    if (request.method === "GET" && url.pathname === "/last") {
+      if (url.searchParams.get("key") !== env.WEBHOOK_SECRET) return new Response("forbidden", { status: 403 });
+      const chatId = url.searchParams.get("chat") ?? env.ADMIN_TELEGRAM_ID.split(",")[0].trim();
+      const v = await env.JOBS.get(`last:${chatId}`);
+      return new Response(v ?? "null", { headers: { "content-type": "application/json; charset=utf-8" } });
     }
     if (request.method === "POST" && url.pathname === "/telegram") {
       if (request.headers.get("x-telegram-bot-api-secret-token") !== env.WEBHOOK_SECRET) {
@@ -113,50 +124,46 @@ export default {
       const cmd = text.split(/[\s@]/)[0].toLowerCase();
       if (cmd === "/start" || cmd === "/help") { await tg.sendMessage(chatId, HELP_TEXT).catch(() => {}); return Response.json({ ok: true }); }
       if (cmd === "/stop") {
-        const instanceId = await env.JOBS.get(`job:${chatId}`);
-        if (!instanceId) { await tg.sendMessage(chatId, "لا توجد مهمة جارية.").catch(() => {}); return Response.json({ ok: true }); }
+        const jobId = await env.JOBS.get(`job:${chatId}`);
+        if (!jobId) { await tg.sendMessage(chatId, "لا توجد مهمة جارية.").catch(() => {}); return Response.json({ ok: true }); }
+        await env.JOBS.put(`stopped:${jobId}`, "1", { expirationTtl: 3600 });
+        // best-effort immediate browser cleanup
         try {
-          const inst = await env.WEB_AGENT_WORKFLOW.get(instanceId);
-          await inst.terminate();
-        } catch { /* already gone */ }
-        await env.JOBS.delete(`job:${chatId}`).catch(() => {});
+          const raw = await env.JOBS.get(`state:${jobId}`);
+          if (raw) { const st = JSON.parse(raw); if (st.browser) await destroySession(env as any, st.browser); }
+        } catch { /* in flight */ }
         await tg.sendMessage(chatId, "⛔ أُوقفت المهمة.").catch(() => {});
         return Response.json({ ok: true });
       }
       if (text.startsWith("/")) { await tg.sendMessage(chatId, "أمر غير معروف. أرسل /help").catch(() => {}); return Response.json({ ok: true }); }
       // a browsing job
-      const existing = await env.JOBS.get(`job:${chatId}`);
-      if (existing) {
-        let running = false;
-        try {
-          const inst = await env.WEB_AGENT_WORKFLOW.get(existing);
-          const status = await inst.status();
-          running = ["queued", "running", "waiting", "paused", "unknown"].includes(String(status?.status ?? status));
-        } catch { /* stale pointer */ }
-        if (running) { await tg.sendMessage(chatId, "⏳ عندي مهمة جارية. انتظرها أو أرسل /stop لإيقافها.").catch(() => {}); return Response.json({ ok: true }); }
-        await env.JOBS.delete(`job:${chatId}`).catch(() => {});
+      if (await env.JOBS.get(`job:${chatId}`)) {
+        await tg.sendMessage(chatId, "⏳ عندي مهمة جارية. انتظرها أو أرسل /stop لإيقافها.").catch(() => {});
+        return Response.json({ ok: true });
       }
       let history: Array<{ goal: string; answer: string }> = [];
       try { history = JSON.parse((await env.JOBS.get(`hist:${chatId}`)) ?? "[]"); } catch { history = []; }
       const statusMsgId = await tg.sendMessage(chatId, "⏳ بدأتُ العمل على المهمة…").catch(() => 0);
-      const id = `job-${chatId}-${Date.now()}`;
-      try {
-        await env.WEB_AGENT_WORKFLOW.create({
-          id,
-          params: { chatId, goal: text, history: historyText(history), statusMsgId } satisfies Params,
-        });
-        await env.JOBS.put(`job:${chatId}`, id, { expirationTtl: 3600 });
-      } catch (e) {
-        await tg.sendMessage(chatId, `❌ تعذّر بدء المهمة: ${(e instanceof Error ? e.message : String(e)).slice(0, 200)}`).catch(() => {});
-      }
+      const jobId = `job-${chatId}-${Date.now()}`;
+      const st = initJobState(chatId, text, historyText(history), statusMsgId);
+      await env.JOBS.put(`state:${jobId}`, JSON.stringify(st), { expirationTtl: 3600 });
+      await env.JOBS.put(`job:${chatId}`, jobId, { expirationTtl: 3600 });
+      await env.JOBS_QUEUE.send({ jobId });
       return Response.json({ ok: true });
-    }
-    if (request.method === "GET" && url.pathname === "/last") {
-      if (url.searchParams.get("key") !== env.WEBHOOK_SECRET) return new Response("forbidden", { status: 403 });
-      const chatId = url.searchParams.get("chat") ?? env.ADMIN_TELEGRAM_ID.split(",")[0].trim();
-      const v = await env.JOBS.get(`last:${chatId}`);
-      return new Response(v ?? "null", { headers: { "content-type": "application/json; charset=utf-8" } });
     }
     return new Response("not found", { status: 404 });
   },
-};
+
+  async queue(batch: MessageBatch, env: Env): Promise<void> {
+    for (const message of batch.messages) {
+      try {
+        const { jobId } = message.body as { jobId: string };
+        await runUnits(env, jobId);
+        message.ack();
+      } catch (e) {
+        console.error("queue unit failed:", e);
+        message.retry();
+      }
+    }
+  },
+} satisfies ExportedHandler<Env>;

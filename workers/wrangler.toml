@@ -7,12 +7,16 @@ compatibility_date = "2026-10-23"
 binding = "JOBS"
 id = "f88fa722eb6a492b986ac67fd4eafa0f"
 
-# One workflow instance per browsing job; each browse loop iteration runs as its
-# own step (fresh 10ms CPU + 50 subrequest budget, unlimited wall clock on I/O).
-[[workflows]]
-name = "web-agent-workflow"
-binding = "WEB_AGENT_WORKFLOW"
-class_name = "WebAgentWorkflow"
+# One queue message chain per browsing job: each delivery is a fresh invocation
+# with a fresh 50-subrequest budget. Consumer runs up to 4 units, re-enqueues.
+[[queues.producers]]
+binding = "JOBS_QUEUE"
+queue = "web-agent-jobs"
+
+[[queues.consumers]]
+queue = "web-agent-jobs"
+max_batch_size = 1
+max_retries = 3
 
 [vars]
 ADMIN_TELEGRAM_ID = "8653341779"
