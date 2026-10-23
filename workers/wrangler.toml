@@ -17,6 +17,7 @@ queue = "web-agent-jobs"
 queue = "web-agent-jobs"
 max_batch_size = 1
 max_retries = 3
+max_concurrency = 1
 
 [vars]
 ADMIN_TELEGRAM_ID = "8653341779"
