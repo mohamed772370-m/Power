@@ -44,7 +44,10 @@ export class Cdp {
   static async connect(wsUrl: string): Promise<Cdp> {
     const ws = new WebSocket(wsUrl);
     const c = new Cdp(ws);
-    ws.accept();
+    // accept() is only meaningful for server-side (incoming) sockets on the
+    // Workers runtime; outbound sockets must not call it (newer workerd throws,
+    // Node lacks it entirely). Tolerate both, keep production behavior unchanged.
+    try { (ws as any).accept?.(); } catch { /* outbound socket: accept not applicable */ }
     await c.open;
     return c;
   }

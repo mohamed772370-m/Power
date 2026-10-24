@@ -1,15 +1,28 @@
 // Pure helpers for browsing (no Deno / network deps, so they are unit-testable).
 // Added 2026-10-21: fixes for stateful-tool dedupe, mission browser steps, inspection cost, context bloat.
 
-export const BROWSER_ACTIONS = ["goto", "click", "fill", "select", "press_enter", "press_key", "scroll_down", "scroll_up", "back", "close_tab", "extract_links", "wait", "vision_check", "screenshot"] as const;
-// Enforced read-only pilot mode (migration safety, 2026-10-23): actions that can
-// change site state are blocked at the schema, dispatcher, and executor layers.
-// Flip to false only with the owner's explicit approval for state-changing tasks.
-export const READ_ONLY_MODE = true;
-export const STATE_CHANGING_ACTIONS = ["click", "fill", "select", "press_enter", "press_key"] as const;
-export const ALLOWED_ACTIONS = READ_ONLY_MODE
-  ? BROWSER_ACTIONS.filter((a) => !(STATE_CHANGING_ACTIONS as readonly string[]).includes(a))
-  : [...BROWSER_ACTIONS];
+export const BROWSER_ACTIONS = [
+  "observe", // read-only: current URL + numbered elements report, no side effects
+  "goto", "click", "fill", "select", "check", "uncheck", "press_enter", "press_key", "scroll_down", "scroll_up", "back", "forward", "reload", "close_tab", "extract_links", "wait", "vision_check", "screenshot"] as const;
+// Review round 5 (N1): forward/reload are navigation-class - a reload can
+// resubmit a POST-result page and forward shares that vector - so they are
+// gated like clicks: interact tier + owner approval only. They entered the
+// read tier only with the M8 port, so gating them restores the original
+// read-only pilot surface. "back" was read-tier BEFORE M8 and stays there to
+// preserve the promised pilot surface (main, round 5); whether back's own
+// POST-resubmission class also requires gating is flagged to the reviewer.
+export const STATE_CHANGING_ACTIONS = ["click", "fill", "select", "check", "uncheck", "press_enter", "press_key", "forward", "reload"] as const;
+// Permission tier travels WITH THE JOB (2026-10-24, integration design): the Telegram
+// pilot path stays at "read" (state-changing actions blocked at schema, dispatcher and
+// executor, unchanged). Internal /task jobs run at "interact" with a confirmation gate
+// (request_confirmation) for commit-class actions. This replaces the old global
+// READ_ONLY_MODE switch - lifting the pilot cap is a designed tier, not a flip.
+export type PermissionTier = "read" | "interact";
+export function allowedActions(tier: PermissionTier): readonly string[] {
+  return tier === "interact"
+    ? [...BROWSER_ACTIONS]
+    : BROWSER_ACTIONS.filter((a) => !(STATE_CHANGING_ACTIONS as readonly string[]).includes(a));
+}
 export type BrowserAct = typeof BROWSER_ACTIONS[number];
 
 // Stateful tools must never be served from the duplicate-call cache:

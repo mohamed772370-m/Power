@@ -28,3 +28,31 @@ max_concurrency = 1
 
 [vars]
 ADMIN_TELEGRAM_ID = "8653341779"
+
+# --- isolated staging environment (approved 2026-10-24; no production bindings) ---
+[env.staging]
+name = "web-agent-staging"
+
+[[env.staging.kv_namespaces]]
+binding = "JOBS"
+id = "bd4f64ccda354e4ebf1b716520966cd0"
+
+[[env.staging.queues.producers]]
+binding = "JOBS_QUEUE"
+queue = "web-agent-staging-jobs"
+
+[[env.staging.queues.consumers]]
+queue = "web-agent-staging-jobs"
+max_batch_size = 1
+max_retries = 3
+max_concurrency = 1
+dead_letter_queue = "web-agent-staging-jobs-dlq"
+
+[[env.staging.queues.consumers]]
+queue = "web-agent-staging-jobs-dlq"
+max_batch_size = 1
+max_retries = 3
+max_concurrency = 1
+
+[env.staging.vars]
+ADMIN_TELEGRAM_ID = "8653341779"

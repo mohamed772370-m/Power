@@ -1,4 +1,4 @@
-import { READ_ONLY_MODE, STATE_CHANGING_ACTIONS } from "./browserutil.ts";
+import { STATE_CHANGING_ACTIONS, type PermissionTier } from "./browserutil.ts";
 // Cloud browser controller for Workers: Kernel (primary) / Steel (backup) cloud
 // sessions driven over CDP WebSocket. Sessions live in the cloud across workflow
 // steps; each action opens a fresh WebSocket to the stored session and leaves
@@ -13,17 +13,28 @@ export interface BrowserSessionInfo {
   sessionId: string;
   cdpWsUrl: string;
   targets: string[]; // tab stack; last = current tab
+  recreated?: boolean; // set after one dead-session recovery; a second death fails the job
 }
 
 export interface BrowserEnv {
   KERNEL_API_KEY?: string;
   STEEL_API_KEY?: string;
+  // Optional job-state KV for the dead-session recovery ledger (write-before-act).
+  JOBS?: KVNamespace;
 }
 
 export interface BrowserCbs {
   sendPhoto: (chatId: number, b64Jpeg: string, caption: string) => Promise<void>;
   analyzeImage: (b64Jpeg: string, prompt: string) => Promise<string>;
+  // Post-execution proof for owner-approved actions (staging review): the browser
+  // layer hands the jpeg out exactly once per approved execution. Failure to record
+  // must never fail the action itself.
+  recordArtifact?: (jpegB64: string) => Promise<void>;
 }
+
+// Thrown when the remote browser session is confirmed dead twice for one job:
+// fails the job fast (queue retry -> DLQ) instead of looping on empty observes.
+export class SessionDeadError extends Error {}
 
 export async function createSession(env: BrowserEnv): Promise<Omit<BrowserSessionInfo, "targets">> {
   const kernelKey = (env.KERNEL_API_KEY ?? "").trim();
@@ -118,6 +129,18 @@ async function settle(page: CdpPage, maxMs: number): Promise<void> {
   await sleep(Math.min(600, Math.max(150, maxMs / 4)));
 }
 
+// The exact one-line format of a numbered element in the markAndCapture report.
+// Exported so the elementSignature parser is tested against the REAL producer
+// format (review N3b), not a hand-written look-alike.
+export function somItemLine(it: Record<string, unknown>): string {
+  let l = `[${it.id}]${it.pos ? " " + it.pos : ""} <${it.tag} ${it.type}>: ${it.text}`;
+  if (it.href) l += ` → ${it.href}`;
+  if (it.val) l += ` (قيمة: ${it.val})`;
+  if (it.checked !== undefined) l += it.checked ? " ☑" : " ☐";
+  if (it.disabled) l += " (معطّل)";
+  return l;
+}
+
 async function markAndCapture(page: CdpPage, opts: { shot?: boolean } = {}): Promise<{ report: string; screenshotB64: string }> {
   let som: any = { items: [], blocked: 0, overlayText: "", scrollY: 0, docH: 0, vh: 0 };
   let pageText = "";
@@ -131,14 +154,7 @@ async function markAndCapture(page: CdpPage, opts: { shot?: boolean } = {}): Pro
   await scan();
   if ((som.items?.length ?? 0) === 0 && pageText.length < 80) { await settle(page, 2000); await scan(); }
   const screenshotB64 = opts.shot ? await page.screenshotJpeg(55).catch(() => "") : "";
-  const lines = ((som.items ?? []) as Array<Record<string, unknown>>).slice(0, 100).map((it) => {
-    let l = `[${it.id}]${it.pos ? " " + it.pos : ""} <${it.tag} ${it.type}>: ${it.text}`;
-    if (it.href) l += ` → ${it.href}`;
-    if (it.val) l += ` (قيمة: ${it.val})`;
-    if (it.checked !== undefined) l += it.checked ? " ☑" : " ☐";
-    if (it.disabled) l += " (معطّل)";
-    return l;
-  });
+  const lines = ((som.items ?? []) as Array<Record<string, unknown>>).slice(0, 100).map(somItemLine);
   const title = await page.title().catch(() => "");
   const url = await page.url().catch(() => "");
   const more = som.docH && som.vh && som.scrollY + som.vh < som.docH - 20;
@@ -167,7 +183,7 @@ const FIND_EL_EXPR = (id: string) => `(() => {
   return { x: r.x + r.width / 2, y: r.y + r.height / 2, opens };
 })()`;
 
-async function actOnce(env: BrowserEnv, sess: BrowserSessionInfo, chatId: number, act: string, target: string, val: string, cbs: BrowserCbs): Promise<string> {
+async function actOnce(env: BrowserEnv, sess: BrowserSessionInfo, chatId: number, act: string, target: string, val: string, cbs: BrowserCbs, captureArtifact = false): Promise<string> {
   const ctx = await connectCtx(sess);
   try {
     let page = ctx.page;
@@ -192,6 +208,11 @@ async function actOnce(env: BrowserEnv, sess: BrowserSessionInfo, chatId: number
       })()`);
     };
 
+    if (act === "observe") {
+      // Read-only observation for approval binding: URL + numbered elements, no side effects.
+      const { report } = await markAndCapture(page);
+      return `👁️ ملاحظة الصفحة الحالية.\n\n${report}`;
+    }
     if (act === "goto") {
       let url = target;
       if (!url.startsWith("http")) url = "https://" + url;
@@ -238,6 +259,23 @@ async function actOnce(env: BrowserEnv, sess: BrowserSessionInfo, chatId: number
       if (!key) throw new Error("press_key يتطلب اسم المفتاح في value (مثل Escape أو Tab أو ArrowDown)");
       await page.pressKey(key);
       await settle(page, 2500);
+    } else if (act === "check" || act === "uncheck") {
+      // Parity with val browser_step (M8): toggle a checkbox/radio only into the
+      // requested state; report the resulting state.
+      const r = await evalOnEl(`const want = ${act === "check" ? "true" : "false"};
+        if (!("checked" in e)) return { ok: false, why: "not-checkable" };
+        if (!!e.checked !== want) e.click();
+        return { ok: true, checked: !!e.checked };`, "");
+      const st = JSON.parse(r || "{}");
+      if (!st.ok) return `⚠️ العنصر [${target}] ليس خانة اختيار (checkbox/radio).`;
+      note = `${st.checked ? "☑️" : "⬜"} العنصر [${target}] الآن ${st.checked ? "مُحدَّد" : "غير مُحدَّد"}.\n`;
+      await settle(page, 800);
+    } else if (act === "forward") {
+      await page.evaluate("history.forward()").catch(() => {});
+      await settle(page, 2000);
+    } else if (act === "reload") {
+      await page.evaluate("location.reload()").catch(() => {});
+      await settle(page, 3000);
     } else if (act === "back") {
       const ok = await page.goBack();
       if (!ok) note = "↩️ لا يوجد سجل للرجوع إليه في هذا التبويب.\n";
@@ -300,7 +338,18 @@ async function actOnce(env: BrowserEnv, sess: BrowserSessionInfo, chatId: number
       const { report } = await markAndCapture(page);
       return "✅ أُرسلت لقطة الشاشة الحالية للمالك.\n\n" + report;
     }
-    const { report, screenshotB64 } = await markAndCapture(page, { shot: act === "vision_check" });
+    const { report, screenshotB64 } = await markAndCapture(page, { shot: act === "vision_check" || captureArtifact });
+    if (captureArtifact && cbs.recordArtifact) {
+      // The artifact must show the action's EFFECT, not the page mid-effect:
+      // async handlers (fetch().then(...)) can resolve after the post-action
+      // settle - staging run9's artifact caught the fixture page before its own
+      // /hit fetch resolved ("clicked" absent), run5's caught it after. Take the
+      // artifact from a second shot one bounded beat later; fall back to the
+      // earlier shot if the second fails.
+      let artifact = screenshotB64;
+      try { await sleep(1500); const later = await page.screenshotJpeg(55); if (later) artifact = later; } catch { /* keep the earlier shot */ }
+      if (artifact) { try { await cbs.recordArtifact(artifact); } catch { /* artifact is evidence, not the action */ } }
+    }
     if (act === "vision_check") {
       const vision = screenshotB64
         ? await cbs.analyzeImage(screenshotB64, val || "افحص شاشة المتصفح المرقمة بدقة: اقرأ الصور أو الكابتشا وحدد أرقام المربعات الحمراء الصحيحة للنقر أو الإدخال.")
@@ -323,17 +372,56 @@ export async function browserAction(
   target: string,
   val: string,
   cbs: BrowserCbs,
+  perms: PermissionTier = "read",
+  opts: { captureArtifact?: boolean } = {},
 ): Promise<{ out: string; sess: BrowserSessionInfo | null }> {
-  // Executor-layer read-only enforcement (defense in depth; schema/dispatcher also guard).
-  if (READ_ONLY_MODE && (STATE_CHANGING_ACTIONS as readonly string[]).includes(act)) {
-    return { out: `🚫 وضع القراءة فقط: الإجراء "${act}" محظور.`, sess };
+  // Executor-layer tier enforcement (defense in depth; schema/dispatcher also guard).
+  // "read" tier blocks state-changing actions; "interact" (internal jobs) permits them
+  // behind the confirmation gate in agent.ts.
+  if (perms === "read" && (STATE_CHANGING_ACTIONS as readonly string[]).includes(act)) {
+    return { out: `🚫 صلاحية القراءة فقط: الإجراء "${act}" محظور.`, sess };
   }
   if (!sess) {
     const created = await createSession(env);
     sess = { ...created, targets: [] };
+  } else if (sess.provider === "kernel" && (env.KERNEL_API_KEY ?? "").trim()) {
+    // Dead remote sessions must not be "used": a dead CDP fails silently (empty
+    // observes) and the job loops its whole step budget (staging run2 stall).
+    // Probe liveness; recover once per session lineage, then fail the job fast.
+    const probe = await fetch(`https://api.onkernel.com/browsers/${sess.sessionId}`, {
+      headers: { Authorization: `Bearer ${(env.KERNEL_API_KEY ?? "").trim()}` },
+      signal: AbortSignal.timeout(10_000),
+    }).catch(() => null);
+    // STAGING_FAULT "probe404": staging-only test hook - the live session is left
+    // completely untouched while the recovery/termination path runs as if the
+    // provider reported it gone. Never set in production.
+    const faulted = (env as { STAGING_FAULT?: string }).STAGING_FAULT === "probe404";
+    if ((probe && probe.status === 404) || faulted) {
+      sess = await recreateOnce(env, sess);
+    }
   }
+
+// One recreate per dead-session lineage. The bound is ledgered in KV BEFORE the
+// recreate attempt (keyed by the DEAD session's id) so a crash or queue
+// redelivery between recreate and state-save cannot silently reset it. KV edge
+// cache (~60s) leaves a bounded residual: a redelivery inside that window can
+// miss the ledger entry and allow one extra recreate; the in-memory flag bounds
+// the common path. A second confirmed death always throws SessionDeadError.
+async function recreateOnce(env: BrowserEnv, sess: BrowserSessionInfo): Promise<BrowserSessionInfo> {
+  if (sess.recreated) throw new SessionDeadError(`browser session ${sess.sessionId} died twice; failing the job instead of looping`);
+  const key = `recreate:${sess.sessionId}`;
+  if (env.JOBS) {
+    const prev = await env.JOBS.get(key).catch(() => null);
+    if (prev) throw new SessionDeadError(`browser session ${sess.sessionId} already consumed its one recovery; failing the job`);
+    await env.JOBS.put(key, "1", { expirationTtl: 6 * 3600 }).catch(() => {});
+  }
+  await destroySession(env, sess).catch(() => {});
+  const created = await createSession(env);
+  return { ...created, targets: [], recreated: true };
+}
+
   try {
-    const out = await actOnce(env, sess, chatId, act, target, val, cbs);
+    const out = await actOnce(env, sess, chatId, act, target, val, cbs, opts.captureArtifact);
     return { out, sess };
   } catch (err) {
     if (err instanceof ElementNotFound) {
@@ -344,15 +432,17 @@ export async function browserAction(
         return { out: `⚠️ ${err.message} اختر رقماً من القائمة الحالية أدناه.\n\n${state}`, sess };
       } catch { return { out: `⚠️ ${err.message}`, sess }; }
     }
-    // session may be dead: destroy and retry once with a fresh one
-    await destroySession(env, sess);
+    // session may be dead: one bounded lineage recovery, then fail closed.
+    // A failure of the retried action on the fresh session is a second death:
+    // propagate SessionDeadError so the job terminalizes instead of looping.
     try {
-      const created = await createSession(env);
-      sess = { ...created, targets: [] };
-      const out = await actOnce(env, sess, chatId, act, target, val, cbs);
+      sess = await recreateOnce(env, sess);
+      const out = await actOnce(env, sess, chatId, act, target, val, cbs, opts.captureArtifact);
       return { out, sess };
     } catch (err2) {
-      return { out: `حدث خطأ أثناء تنفيذ حركة المتصفح (${act}): ${err2 instanceof Error ? err2.message : String(err2)}`, sess: null };
+      if (err2 instanceof SessionDeadError) throw err2;
+      if (err2 instanceof ElementNotFound) return { out: `⚠️ ${err2.message}`, sess };
+      throw new SessionDeadError(`browser action failed again on the recovered session: ${err2 instanceof Error ? err2.message : String(err2)}`);
     }
   }
 }
