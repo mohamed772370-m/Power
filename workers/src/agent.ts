@@ -64,7 +64,11 @@ export interface JobState {
 
 const MAX_STEPS = 22;
 const SUB_BUDGET_MS = 240_000;
-export const JOB_TIMEOUT_MS = 20 * 60_000;
+// 60 min (owner reply «صلح» 2026-10-24 07:30 +03 to the offered 15->30-min reply
+// window; raised together with it - the reply window must stay below this budget
+// or a late decision burns into an already-timed-out task). The 10-min approvedAction expiry in applyConfirmation
+// is deliberately NOT coupled to this: it binds an approval to a fresh page state.
+export const JOB_TIMEOUT_MS = 60 * 60_000;
 const OBSERVED_CAP = 200_000;
 const MIN_STEP_MS = 6000;
 

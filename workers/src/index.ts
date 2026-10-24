@@ -131,6 +131,21 @@ async function runUnits(env: Env, jobId: string, decision?: string, decisionNonc
   }
   let st = JSON.parse(raw) as JobState;
   const jobTg = st.origin === "internal" ? NOOP_TG : tg;
+  // Stale-read decision guard (prod incident 2026-10-24, job ...12d899a9): KV edge
+  // caches can serve a pre-await snapshot of state: for up to ~60s after the pause
+  // was written; a decision delivery reading it would otherwise CONTINUE from that
+  // snapshot and silently drop the owner's decision (applyConfirmation no-ops on a
+  // non-awaiting state). A decision against a state that could be pre-await means
+  // the read is stale: throw (tagged; the queue handler redelivers with a 35s delay,
+  // so the 3 retries span ~105s > the ~60s cache window) instead of losing the
+  // decision. A consumed round (confirmSeq > 0 / approvedAction set) or a terminal
+  // state means a duplicate decision: drop it quietly.
+  if ((decision === "approved" || decision === "rejected") && (st.next !== "await_confirm" || !st.pendingConfirm)) {
+    if (st.next !== "done" && (st.confirmSeq ?? 0) === 0 && !st.approvedAction) {
+      throw new Error("stale-decision-read: redeliver with delay");
+    }
+    return;
+  }
   try {
     // Confirmation resume (queue-serialized first-wins, R3): the decision arrives in
     // THIS message's body. First nonce-matching decision moves the state out of
@@ -208,6 +223,14 @@ async function runUnits(env: Env, jobId: string, decision?: string, decisionNonc
     // TTL matches the 24h awaiting marker so the job stays resumable as long as
     // /task-result reports awaiting_confirmation (H4).
     await env.JOBS.put(`state:${jobId}`, JSON.stringify(st), { expirationTtl: 86400 });
+    // Fresh-key awaiting record (prod incident 2026-10-24): state: is edge-cached at
+    // any PoP that read it during the run, so /task-confirm could read a pre-await
+    // snapshot for up to ~60s after this write and refuse a fast owner reply with a
+    // false "not awaiting" 409. confirm:${jobId} is a brand-new key per task - never
+    // read anywhere before - so its first read at any PoP is a cold central read (KV
+    // docs: initial reads have no cached value) and always fresh. TTL mirrors state:
+    // so a task dying between write and delete cannot leak the key (review checkpoint).
+    await env.JOBS.put(`confirm:${jobId}`, JSON.stringify({ nonce: st.pendingConfirm?.nonce ?? "", at: Date.now() }), { expirationTtl: 86400 });
     if (st.origin === "internal") {
       await env.JOBS.put(`result:${jobId}`, JSON.stringify({
         // nonce included (review F1a): the pull fallback must be able to answer the
@@ -400,7 +423,24 @@ export default {
       let st: JobState;
       try { st = JSON.parse(raw) as JobState; } catch { return Response.json({ error: "corrupt state" }, { status: 500 }); }
       if (await stopSignalVisible(env, id)) return Response.json({ error: "task was cancelled; confirmation refused" }, { status: 409 });
-      if (st.next !== "await_confirm" || !st.pendingConfirm) return Response.json({ error: "task is not awaiting confirmation" }, { status: 409 });
+      if (st.next !== "await_confirm" || !st.pendingConfirm) {
+        // KV reads are edge-cached up to ~60s: a fast owner reply can land while this
+        // PoP still serves the pre-await snapshot of state: (the await-state write
+        // PRECEDES the callback - prod incident 2026-10-24). Fall back to the fresh
+        // awaiting record. Boundary (review 2026-10-24): only a read state that could
+        // be a pre-await snapshot falls back - a consumed round (confirmSeq > 0 or
+        // approvedAction set) or a terminal state refuses immediately.
+        const couldBePreAwait = st.next !== "done" && (st.confirmSeq ?? 0) === 0 && !st.approvedAction;
+        const rec = couldBePreAwait ? await env.JOBS.get(`confirm:${id}`) : null;
+        if (!rec) return Response.json({ error: "task is not awaiting confirmation" }, { status: 409 });
+        try {
+          // The nonce check below runs against THIS fresh record, so the fallback
+          // can never bypass the per-round nonce binding (review checkpoint 1).
+          st.pendingConfirm = { nonce: String((JSON.parse(rec) as any).nonce ?? "") } as JobState["pendingConfirm"];
+        } catch {
+          return Response.json({ error: "corrupt confirm record" }, { status: 500 });
+        }
+      }
       // Bind the decision to THIS confirmation round (review B2): the nonce is
       // disclosed only via the awaiting_confirmation callback/read for this pause.
       const nonce = String(body?.nonce ?? "");
@@ -420,6 +460,10 @@ export default {
         return Response.json({ error: `failed to queue decision: ${(e instanceof Error ? e.message : String(e)).slice(0, 120)}` }, { status: 502 });
       }
       await env.JOBS.delete(`result:${id}`).catch(() => {}); // clear the awaiting marker
+      // Consume the fresh awaiting record. A duplicate confirm inside the delete's
+      // propagation window can re-queue at most one more decision; the consumer's
+      // nonce + consumed-round guards drop it (see runUnits).
+      await env.JOBS.delete(`confirm:${id}`).catch(() => {});
       return Response.json({ ok: true, decision, applied: "queued" });
     }
     if (request.method === "POST" && url.pathname === "/telegram") {
@@ -504,7 +548,7 @@ export default {
               if (st.browser) await destroySession(env as any, st.browser).catch(() => {});
             } catch { /* best effort */ }
           }
-          const note = `❌ تعذّر إكمال المهمة بعد عدة محاولات (عطل داخلي، لم تُحذف بياناتك): ${goal.slice(0, 150)}\nأعد إرسال الطلب للمحاولة مجدداً.`;
+          const note = `❌ توقفت المهمة: نفدت محاولات التسليم الداخلي لخطواتها (عطل نقل داخلي، لم تُحذف بياناتك). أعد إرسال الطلب كما هو للمحاولة مجدداً: ${goal.slice(0, 150)}`;
           if (origin === "internal") {
             await env.JOBS.put(`result:${jobId}`, JSON.stringify({ status: "failed", text: note, ms: 0, at: Date.now() }), { expirationTtl: 86400 }).catch(() => {});
             if (cbChatId) await notifyVal(env, { jobId, callbackChatId: cbChatId } as JobState, { status: "failed", text: note });
@@ -529,7 +573,11 @@ export default {
         message.ack();
       } catch (e) {
         console.error("queue unit failed:", e);
-        message.retry();
+        // A stale decision read must outlive the ~60s KV edge-cache window: 3 retries
+        // at 35s span ~105s (review condition 2026-10-24). Other failures keep the
+        // platform default backoff.
+        if (e instanceof Error && e.message.startsWith("stale-decision-read")) message.retry({ delaySeconds: 35 });
+        else message.retry();
       }
     }
   },
