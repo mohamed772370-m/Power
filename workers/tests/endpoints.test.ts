@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import worker from "../src/index.ts";
-import { applyConfirmation, initJobState } from "../src/agent.ts";
+import { applyConfirmation, initJobState, JOB_TIMEOUT_MS } from "../src/agent.ts";
 
 function fakeKv(seed: Record<string, string> = {}) {
   const m = new Map(Object.entries(seed));
@@ -65,6 +65,24 @@ test("endpoints: confirm validates + queues the decision; application is queue-s
   assert.deepEqual(e._sent.at(-1), { jobId: "j1", decision: "approved", nonce: "n-1" });
   // no KV decision record exists - the decision lives only in the message (R3)
   assert.equal(await kv.get("confirm:j1"), null);
+});
+
+test("endpoints: stale-snapshot confirm - the fresh confirm:<id> key accepts the decision once when state: lacks pendingConfirm", async () => {
+  // The d899a9 409 race (2026-10-24): /task-confirm can read a pre-await state:
+  // snapshot; the per-task await key written at pause is the authority here.
+  const st = initJobState(0, "مهمة", "", 0, { origin: "internal", perms: "interact", jobId: "j3" });
+  st.next = "await_confirm"; // the stale snapshot has no pendingConfirm yet
+  const kv = fakeKv({
+    "state:j3": JSON.stringify(st),
+    "confirm:j3": JSON.stringify({ nonce: "n-3", at: Date.now() }),
+  });
+  const e = env(kv);
+  const ok = await worker.fetch(post("/task-confirm", { id: "j3", approve: true, nonce: "n-3" }, "s3cret"), e);
+  assert.equal(ok.status, 200);
+  assert.deepEqual(e._sent.at(-1), { jobId: "j3", decision: "approved", nonce: "n-3" });
+  assert.equal(await kv.get("confirm:j3"), null, "the fallback consumed the await key");
+  const replay = await worker.fetch(post("/task-confirm", { id: "j3", approve: true, nonce: "n-3" }, "s3cret"), e);
+  assert.equal(replay.status, 409, "a replayed decision after consumption still 409s");
 });
 
 test("endpoints: cancel-mid-await stops the task and a late confirm is refused", async () => {
@@ -239,7 +257,7 @@ test("endpoints: /task-artifact serves the stored execution jpeg behind the secr
 test("runUnits: a job over its wall-clock budget terminalizes AT DELIVERY (no llm unit needed), state cleaned", async () => {
   const st = initJobState(0, "مهمة", "", 0, { origin: "internal", perms: "interact", jobId: "j-budget" });
   st.next = "llm"; // would normally call the LLM - the delivery-level budget must fire first
-  st.startedAt = Date.now() - 21 * 60_000; // JOB_TIMEOUT_MS is 20 min
+  st.startedAt = Date.now() - JOB_TIMEOUT_MS - 60_000; // one minute past the job wall-clock budget
   const kv = fakeKv({ "state:j-budget": JSON.stringify(st) });
   const e = env(kv);
   const llm = stubLlm();
