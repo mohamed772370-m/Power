@@ -444,7 +444,7 @@ export default {
       // Bind the decision to THIS confirmation round (review B2): the nonce is
       // disclosed only via the awaiting_confirmation callback/read for this pause.
       const nonce = String(body?.nonce ?? "");
-      if (!nonce || nonce !== st.pendingConfirm.nonce) {
+      if (!nonce || nonce !== st.pendingConfirm!.nonce) {
         return Response.json({ error: "nonce mismatch: this answers a stale or foreign confirmation round" }, { status: 409 });
       }
       // Decisions are applied by the job's own queue chain, which is already serialized
